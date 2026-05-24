@@ -277,20 +277,93 @@ path differ.
 | `drifting_temperatures` | `(0.02, 0.05, 0.2)` | Force-field temperatures (R_list) |
 | `drifting_per_timestep_loss` | `False` | Per-timestep weighting (off for single-step) |
 
-**🚀 Run fine-tuning on LIBERO:**
+#### Step-by-step
+
+**1️⃣ Get the FM pretrain checkpoint**
+
+The drifting fine-tuning starts from the same `a1-pretrain` checkpoint used
+by standard LIBERO fine-tuning. Place it under `model/pretrain/`:
+
+```bash
+mkdir -p model
+
+# Option A: huggingface-cli with the hf-mirror endpoint (China-friendly)
+export HF_ENDPOINT=https://hf-mirror.com
+hf download spatialtemporal-ai/a1-pretrain --local-dir model/pretrain
+
+# Option B: hfd.sh + aria2c (fastest, recommended on cloud servers)
+curl -fsSL -o ~/hfd.sh https://hf-mirror.com/hfd/hfd.sh && chmod +x ~/hfd.sh
+conda install -y -c conda-forge aria2     # or: sudo apt install -y aria2
+~/hfd.sh spatialtemporal-ai/a1-pretrain --tool aria2c -x 8 \
+  --local-dir model/pretrain
+```
+
+After downloading verify the layout:
+
+```bash
+ls model/pretrain/   # expect model.pt (or step*-unsharded/), config.yaml, dataset_statistics.json
+```
+
+**2️⃣ Get the LIBERO RLDS dataset**
+
+```bash
+mkdir -p data
+hf download spatialtemporal-ai/libero_rlds \
+  --repo-type dataset --local-dir data/libero_rlds
+```
+
+The dataset path matches `configs/datasets/libero_4_tasks.yaml`
+(`path: data/libero_rlds`).
+
+**3️⃣ Configure environment**
+
+```bash
+cp .env.example .env.personal       # if not done yet
+# edit .env.personal: CONDA_ROOT, CONDA_ENV, WANDB_ENTITY, WANDB_PROJECT
+```
+
+**4️⃣ Launch drifting fine-tuning**
+
 ```bash
 bash train_libero_drifting.sh
 ```
 
-This script loads the same `model/pretrain` checkpoint as `train_libero.sh`
-and switches `--action_head` from `flow_matching` to `drifting`; all other
-training hyperparameters (learning rates, warmup, batch size) remain
-identical so the FM-pretrained action head weights transfer one-to-one.
+The script:
+- Loads the FM checkpoint at `model/pretrain` (Qwen2-400M action-head weights
+  transfer one-to-one because the architecture is unchanged).
+- Sets `--action_head drifting`, which activates the force-field drift loss
+  during training and the single-step `noise → action` inference path.
+- Saves checkpoints to `./model/checkpoints/a1_libero_drifting/` every 1000
+  steps.
 
-> **💡 Tip:** To enable drifting in other training scripts, pass
-> `--action_head drifting` to `launch_scripts/train_vla.py`. The early-exit
-> mechanism works without modification because each layer's inference is
-> already single-step.
+**5️⃣ Evaluate**
+
+After training, point the LIBERO eval scripts at the new checkpoint:
+
+```bash
+# Edit eval_libero.sh to set the checkpoint path, then:
+bash eval_libero.sh
+```
+
+The early-exit evaluator (`eval_libero_exit.sh`) also works out of the box
+because the per-layer ActionValueNet has been extended to recognise the
+drifting head.
+
+#### Tuning knobs
+
+The script defaults match `train_libero.sh`. Common things to tweak:
+
+| Argument | Effect |
+|:---------|:-------|
+| `--train_steps 30000` | Drifting from a converged FM checkpoint usually converges in 30–50k steps; 500k is overkill. |
+| `--llm_learning_rate 5e-6` | Already conservative; lower further (e.g. `1e-6`) if you observe VLM drift. |
+| `--action_head_learning_rate 5e-5` | The main learning signal lives here. |
+| `BATCH_PER_GPU=32` | Reduce to 16 if you OOM; raise to 64 on H100/A100-80G. |
+
+> **💡 Tip:** To enable drifting in any other training script, just change
+> `--action_head flow_matching` to `--action_head drifting` and point
+> `--checkpoint` at an FM pretrain (the `--choices` list in
+> `launch_scripts/train_vla.py` already accepts `drifting`).
 
 ---
 

@@ -256,6 +256,44 @@ bash train_libero.sh
 
 ---
 
+### ⚡ Drifting Fine-tuning (Single-step Action Head)
+
+Drifting replaces flow matching's multi-step Euler integration with a single
+forward pass at `t = 1`, trained with a force-field based goal-regression
+loss. The action head architecture (Qwen2-400M) is unchanged, so the FM
+pretrain checkpoint can be loaded directly — only the loss and inference
+path differ.
+
+**📁 Relevant files:**
+- 🧩 `a1/vla/drifting_util.py` - Drifting loss implementation
+- 📄 `configs/experiments/libero_simulation.yaml` - Reused LIBERO config
+- 🖥️ `train_libero_drifting.sh` - LIBERO drifting fine-tuning script
+
+**🔧 Key hyperparameters** (in `a1/config.py`):
+| Field | Default | Description |
+|:------|:-------:|:------------|
+| `use_drifting_loss` | `False` | Toggle drifting loss |
+| `drifting_gen_per_label` | `4` | Noise samples per label (G) |
+| `drifting_temperatures` | `(0.02, 0.05, 0.2)` | Force-field temperatures (R_list) |
+| `drifting_per_timestep_loss` | `False` | Per-timestep weighting (off for single-step) |
+
+**🚀 Run fine-tuning on LIBERO:**
+```bash
+bash train_libero_drifting.sh
+```
+
+This script loads the same `model/pretrain` checkpoint as `train_libero.sh`
+and switches `--action_head` from `flow_matching` to `drifting`; all other
+training hyperparameters (learning rates, warmup, batch size) remain
+identical so the FM-pretrained action head weights transfer one-to-one.
+
+> **💡 Tip:** To enable drifting in other training scripts, pass
+> `--action_head drifting` to `launch_scripts/train_vla.py`. The early-exit
+> mechanism works without modification because each layer's inference is
+> already single-step.
+
+---
+
 ### 🧪 VLAbench Training
 
 VLAbench training fine-tunes in the VLAbench simulation environment.

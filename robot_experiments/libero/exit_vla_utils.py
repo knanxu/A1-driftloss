@@ -489,7 +489,7 @@ def get_vla_action(
             "action_proprio":batch_data.get("proprio"),  
             "proprio_token_idx":  batch_data.get("proprio_token_idx"), 
             "output_hidden_states": output_hidden_states,
-            "use_cache": True if model.config.action_head == 'flow_matching' else False,
+            "use_cache": True if model.config.action_head in ('flow_matching', 'drifting') else False,
         }
         # 准备捕获 exit id 的机制，用于 FLOPs 缓存键
         captured_exit_id = [None]

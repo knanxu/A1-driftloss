@@ -105,7 +105,7 @@ if __name__ == "__main__":
 
         parser.add_argument("--action_loss_weight", default=1.0, type=float)
         parser.add_argument("--state_mask_prob", default=0.5, type=float, help="Probability of randomly masking state to 0 during training (0.0-1.0)")
-        parser.add_argument("--action_head",default="flow_matching",type=str,choices=["l1_regression", "diffusion", "diffusion_openvla","flow_matching","flow_matching_joint"])
+        parser.add_argument("--action_head",default="flow_matching",type=str,choices=["l1_regression", "diffusion", "diffusion_openvla","flow_matching","flow_matching_joint","drifting"])
 
         parser.add_argument("--action_head_diffusion_train_steps", default=1000, type=int, help="Number of diffusion steps for the action head")
         parser.add_argument("--action_head_diffusion_inference_steps", default=10, type=int) # 10

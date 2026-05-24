@@ -830,7 +830,17 @@ class ModelConfig(BaseConfig):
     """ The intermediate size of the flow matching action head."""
     action_head_flow_matching_pvf_function: str = "2d_attn_mask"
 
-    
+    # Drifting action head params (reuses flow matching Qwen2 architecture)
+    use_drifting_loss: bool = False
+    """ Use drifting loss instead of flow matching loss for the flow matching action head. """
+    drifting_gen_per_label: int = 4
+    """ Number of generated samples per ground-truth label for drifting loss. """
+    drifting_temperatures: Tuple[float, ...] = (0.02, 0.05, 0.2)
+    """ Temperature values (R_list) for drifting loss. """
+    drifting_per_timestep_loss: bool = False
+    """ If True, compute drifting loss per action timestep then average. """
+
+
     llm_causal_attention: bool = False
     """ Whether to use causal attention in the LLM transformer """
     

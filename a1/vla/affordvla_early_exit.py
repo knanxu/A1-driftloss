@@ -21,6 +21,7 @@ from a1.config import (
 
 from a1.vla.action_heads import (L1RegressionActionHead, DiffusionTransformerActionHead,DiffusionActionHead,
                                     FlowMatchingActionHead)
+from a1.vla.drifting_util import drift_loss
 from a1.vla.projectors import ProprioProjector
 from a1.vla.dit.blocks import DiTBlock,FinalLayer,TimestepEmbedder
 from a1.vla.dit.model import DiT
@@ -100,7 +101,7 @@ class AffordVLAEarlyExit(Molmo):
             # flow matching expert head that cross-attends to prefix from main LLM
             self.action_head = FlowMatchingActionHead(
                 llm_dim=self.config.d_model,
-                action_dim=config.fixed_action_dim,  
+                action_dim=config.fixed_action_dim,
                 proprio_dim=config.proprio_dim,
                 horizon=config.num_actions_chunk,
                 qwen2_hidden_size=getattr(self.config, 'action_head_flow_matching_dim', 896),
@@ -109,6 +110,23 @@ class AffordVLAEarlyExit(Molmo):
                 qwen2_intermediate_size=getattr(self.config, 'action_head_flow_matching_intermediate_size', 4096),
                 qwen2_num_kv_heads=4,
             )
+        elif self.action_head_type == 'drifting':
+            # drifting action head: same Qwen2 architecture as flow matching,
+            # but trained with drifting loss and does single-step inference
+            self.action_head = FlowMatchingActionHead(
+                llm_dim=self.config.d_model,
+                action_dim=config.fixed_action_dim,
+                proprio_dim=config.proprio_dim,
+                horizon=config.num_actions_chunk,
+                qwen2_hidden_size=getattr(self.config, 'action_head_flow_matching_dim', 896),
+                qwen2_num_layers=getattr(self.config, 'action_head_flow_matching_layers', 18),
+                qwen2_num_heads=getattr(self.config, 'action_head_flow_matching_heads', 8),
+                qwen2_intermediate_size=getattr(self.config, 'action_head_flow_matching_intermediate_size', 4096),
+                qwen2_num_kv_heads=4,
+            )
+            self.drifting_gen_per_label = config.drifting_gen_per_label
+            self.drifting_temperatures = config.drifting_temperatures
+            self.drifting_per_timestep_loss = config.drifting_per_timestep_loss
 
         if config.use_proprio:
             if config.proprio_dim != config.action_dim:
@@ -262,7 +280,28 @@ class AffordVLAEarlyExit(Molmo):
         predicted_actions = x
         return predicted_actions
 
-        
+    def predict_actions_drifting(self, attn_key_values, proprio, pos_offset):
+        """Single-step drifting inference: feed pure noise at t=1, get actions directly."""
+        if not attn_key_values or len(attn_key_values) == 0:
+            raise ValueError("attn_key_values is empty; drifting requires KV cache from forward()")
+        device = attn_key_values[0][0].device
+        dtype = attn_key_values[0][0].dtype
+        B = attn_key_values[0][0].shape[0]
+
+        noise = torch.randn((B, self.config.num_actions_chunk, self.config.fixed_action_dim), device=device, dtype=dtype)
+        t = torch.ones(B, device=device, dtype=dtype)
+
+        assert self.config.use_proprio, "drifting requires use_proprio=True"
+        state = proprio
+        assert state is not None, "action_proprio is required for drifting inference"
+
+        v = self.action_head.predict_vector_field(attn_key_values, state, noise, t, pos_offset=pos_offset)
+        # For drifting model, the network directly predicts the action (not a velocity field).
+        # At t=1 (pure noise), the output is: action = noise - v (since v = noise - action in FM convention)
+        predicted_actions = noise - v
+        return predicted_actions
+
+
     def predict_actions(self,input_ids,images=None, **kwargs):
         if self.action_head_type == 'diffusion_openvla':
             return self.run_diffusion_sampling(input_ids,images, **kwargs)
@@ -294,6 +333,19 @@ class AffordVLAEarlyExit(Molmo):
                 return exit_action
             else:
                 raise ValueError("No exit action found")
+        elif self.action_head_type == 'drifting':
+            kwargs.pop('use_cache', None)
+            outputs = self.forward(input_ids, images=images, use_cache=True, **kwargs)
+            exit_action = outputs.exit_action
+            if exit_action is not None:
+                return exit_action
+            else:
+                # No early exit triggered; run single-step drifting on full KV cache
+                past_key_values = outputs.attn_key_values
+                pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
+                predicted_actions = self.predict_actions_drifting(
+                    past_key_values, kwargs.get('action_proprio'), pos_offset
+                )
             # past_key_values = outputs.attn_key_values
 
             # # Euler steps with expert only
@@ -475,7 +527,7 @@ class AffordVLAEarlyExit(Molmo):
             size_based_module_to_wrap.add(self.action_head.action_adaptor)
             size_based_module_to_wrap.add(self.action_head.condition_adaptor)
 
-        if hasattr(self, 'action_head') and self.action_head_type == 'flow_matching':
+        if hasattr(self, 'action_head') and self.action_head_type in ('flow_matching', 'drifting'):
             size_based_module_to_wrap.add(self.action_head.qwen2.model)
             size_based_module_to_wrap.add(self.action_head.action_out)
             size_based_module_to_wrap.add(self.action_head.state_proj)
@@ -894,10 +946,10 @@ class AffordVLAEarlyExit(Molmo):
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
-        if self.action_head_type == 'flow_matching':
-            attn_key_values = [] 
+        if self.action_head_type in ('flow_matching', 'drifting'):
+            attn_key_values = []
 
-        if self.action_head_type == 'flow_matching':
+        if self.action_head_type in ('flow_matching', 'drifting'):
             start_idx, end_idx = len(input_ids)-2, len(input_ids)-1 # dummy value
         else:
             start_idx, end_idx = self.get_action_idx(input_ids,proprio_token_idx)
@@ -941,7 +993,7 @@ class AffordVLAEarlyExit(Molmo):
                 
                 if exit_controller is not None:
                     pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
-                    feats_for_exit = attn_key_values if self.action_head_type == 'flow_matching' else all_hidden_states
+                    feats_for_exit = attn_key_values if self.action_head_type in ('flow_matching', 'drifting') else all_hidden_states
                     exit_flag, exit_action = exit_controller(feats_for_exit, block_idx, action_proprio, start_idx, end_idx, pos_offset)
                     if exit_flag:
                         # print(f"*** Exit by exit_controller, block_idx: {block_idx}")
@@ -1059,7 +1111,7 @@ class AffordVLAEarlyExit(Molmo):
                 llm_dtype = next(self.transformer.parameters()).dtype
                 # 确保 action_head 参数与主 LLM 一致的 dtype（bf16/fp32）
                 self.action_head.to(llm_dtype)
-                
+
                 # sample noisy path
                 B = target_actions.shape[0]
                 device = target_actions.device
@@ -1077,13 +1129,72 @@ class AffordVLAEarlyExit(Molmo):
                 pred = pred.to(dtype)
                 predicted_actions = None
 
-                return {  
-                    'predicted_actions': predicted_actions,  
+                return {
+                    'predicted_actions': predicted_actions,
                     'diffusion_target': target,
                     'diffusion_pred': pred,
                     'diff_timesteps': timesteps,
                 }
-            
+
+            def generate_action_drifting(attn_key_values):
+                """Drifting loss: single forward at t=1 with G noise samples per label."""
+                llm_dtype = next(self.transformer.parameters()).dtype
+                self.action_head.to(llm_dtype)
+
+                B = target_actions.shape[0]
+                G = self.drifting_gen_per_label
+                device = target_actions.device
+                dtype = llm_dtype
+                action_horizon = self.config.num_actions_chunk
+                action_dim = self.config.fixed_action_dim
+
+                assert self.config.use_proprio and action_proprio is not None, "drifting requires action_proprio"
+                pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
+
+                # Repeat proprio G times
+                proprio_rep = action_proprio.repeat_interleave(G, dim=0).to(dtype)
+                pos_offset_rep = pos_offset.repeat_interleave(G, dim=0)
+
+                # Repeat KV cache G times
+                attn_key_values_rep = []
+                for k, v in attn_key_values:
+                    attn_key_values_rep.append((
+                        k.repeat_interleave(G, dim=0),
+                        v.repeat_interleave(G, dim=0),
+                    ))
+
+                # Pure noise at t=1
+                noise = torch.randn(B * G, action_horizon, action_dim, device=device, dtype=dtype)
+                t_ones = torch.ones(B * G, device=device, dtype=dtype)
+
+                # Single forward pass through action head
+                v_pred = self.action_head.predict_vector_field(
+                    attn_key_values_rep, proprio_rep, noise, t_ones, pos_offset=pos_offset_rep
+                )
+                # In FM convention: v = noise - action, so predicted action = noise - v
+                pred_actions = (noise - v_pred).reshape(B, G, action_horizon, action_dim)
+
+                R_list = tuple(self.drifting_temperatures)
+
+                if self.drifting_per_timestep_loss:
+                    total_loss = torch.zeros(1, device=device, dtype=torch.float32)
+                    for t_idx in range(action_horizon):
+                        gen_t = pred_actions[:, :, t_idx, :].float()
+                        pos_t = target_actions[:, t_idx, :].unsqueeze(1).float()
+                        loss_t, _ = drift_loss(gen_t, pos_t, R_list=R_list)
+                        total_loss = total_loss + loss_t.mean()
+                    loss = total_loss / action_horizon
+                else:
+                    gen = pred_actions.reshape(B, G, -1).float()
+                    pos = target_actions.reshape(B, 1, -1).float()
+                    loss, _ = drift_loss(gen, pos, R_list=R_list)
+                    loss = loss.mean()
+
+                return {
+                    'predicted_actions': None,
+                    'drifting_loss': loss,
+                }
+
 
             outputs_list = []
             # randomly sample a layer to exit, or supervise all layers
@@ -1100,6 +1211,18 @@ class AffordVLAEarlyExit(Molmo):
                     # gen the attn_key_values up to i-th layer
                     attn_key_values_i = attn_key_values[:i+1]
                     outputs = generate_action_flow_matching(attn_key_values_i)
+                    outputs_list.append(outputs)
+
+            elif self.action_head_type == "drifting":
+                assert attn_key_values is not None, "attn_key_values is required for drifting"
+                assert len(attn_key_values) > 0, "attn_key_values is required for drifting"
+                n = len(attn_key_values)
+                for i in range(n):
+                    if train_exit_random_layer is not None:
+                        if i != train_exit_random_layer_id:
+                            continue
+                    attn_key_values_i = attn_key_values[:i+1]
+                    outputs = generate_action_drifting(attn_key_values_i)
                     outputs_list.append(outputs)
 
             else:

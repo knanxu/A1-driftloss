@@ -130,26 +130,32 @@ class ActionValueNet(BaseValueNet):
             if len(self.action_list) == 0:
                 # Use previous layer's feature as pseudo previous action for the first check
                 prev_layer_idx = max(0, i - 1)
-                if self.model.config.action_head != 'flow_matching':
+                if self.model.config.action_head not in ('flow_matching', 'drifting'):
                     prev_action = self.model.predict_actions_by_hidden_states_by_idx(feats[prev_layer_idx], start_idx, end_idx)
+                elif self.model.config.action_head == 'drifting':
+                    prev_action = self.model.predict_actions_drifting(feats[:prev_layer_idx+1], proprio, pos_offset)
                 else:
                     prev_action = self.model.predict_actions_flow_matching(feats[:prev_layer_idx+1], proprio, pos_offset)
             elif i > 0 and i - self.interval < 0:
-                if self.model.config.action_head != 'flow_matching':
+                if self.model.config.action_head not in ('flow_matching', 'drifting'):
                     prev_action = self.model.predict_actions_by_hidden_states_by_idx(feats[i-1], start_idx, end_idx)
+                elif self.model.config.action_head == 'drifting':
+                    prev_action = self.model.predict_actions_drifting(feats[:i], proprio, pos_offset)
                 else:
                     prev_action = self.model.predict_actions_flow_matching(feats[:i], proprio, pos_offset)
             else:
                 prev_action = self.action_list[-1]
-            
+
             # action = self.exit_head(feats[i],)
-            if self.model.config.action_head != 'flow_matching':
+            if self.model.config.action_head not in ('flow_matching', 'drifting'):
                 action = self.model.predict_actions_by_hidden_states_by_idx(feats[i], start_idx, end_idx)
+            elif self.model.config.action_head == 'drifting':
+                action = self.model.predict_actions_drifting(feats[:i+1], proprio, pos_offset)
             else:
                 action = self.model.predict_actions_flow_matching(
-                    feats[:i+1], proprio, pos_offset, 
+                    feats[:i+1], proprio, pos_offset,
                     input_x=self.action_list[-1] if (self.anchor and len(self.action_list) > 0) else None)
-            self.action_list.append(action)   
+            self.action_list.append(action)
             delta = get_delta(action[0], prev_action[0])
 
             return delta, action
@@ -187,7 +193,7 @@ class ActionValueNet(BaseValueNet):
             # - attn_key_values (flow_matching): List[Tuple[Tensor, Tensor]] → 逐层截断 KV 并循环前向
             selected_layers = [0] + self.exit_list
 
-            if self.model.config.action_head != 'flow_matching':
+            if self.model.config.action_head not in ('flow_matching', 'drifting'):
                 # 向量化：将所有 exit 的隐藏态一次性送入动作头，减少前向调用次数
                 layer_hiddens = [feats[i] for i in selected_layers]  # 每个形状: (B, L, D)
                 # (E+1, B, L, D)
@@ -203,6 +209,15 @@ class ActionValueNet(BaseValueNet):
                     exit_action_stack = actions_stacked[:, 0]
                 else:
                     exit_action_stack = actions_flat.reshape(E_plus_1, B, -1)[:, 0]
+            elif self.model.config.action_head == 'drifting':
+                # drifting: single-step inference per layer, no warm-start needed
+                actions_per_exit = []
+                for layer_idx in selected_layers:
+                    kvs_i = feats[:layer_idx + 1]
+                    actions_i = self.model.predict_actions_drifting(kvs_i, proprio, pos_offset)
+                    actions_per_exit.append(actions_i)
+                actions_stacked = torch.stack(actions_per_exit, dim=0)
+                exit_action_stack = actions_stacked[:, 0]
             else:
                 # flow matching: feats 是按层的 (k, v) 序列
                 actions_per_exit = []
@@ -444,15 +459,15 @@ def generate_action_values(
                     position_ids=batch.get("position_ids"),
                     action_proprio=batch["proprio"],  ##
                     proprio_token_idx = batch["proprio_token_idx"],  ##
-                    output_hidden_states=True if model.config.action_head != "flow_matching" else None,
-                    use_cache=True if model.config.action_head == 'flow_matching' else False,
+                    output_hidden_states=True if model.config.action_head not in ("flow_matching", "drifting") else None,
+                    use_cache=True if model.config.action_head in ('flow_matching', 'drifting') else False,
                     # Skip final LN+logits by exiting at last block to save time
                     exit_id=getattr(model.config, 'n_layers', None) - 1 if hasattr(model, 'config') else None,
                     # We don't need full logits for threshold calibration; compute minimal logits to save time
                     last_logits_only=True,
                 )
 
-            if model.config.action_head != 'flow_matching':
+            if model.config.action_head not in ('flow_matching', 'drifting'):
                 start_idx, end_idx = model.get_action_idx(batch["input_ids"])
             else:
                 start_idx, end_idx = 0, 0
@@ -515,10 +530,10 @@ def generate_action_values(
             #         only_extra_exit=True,
             #     )
 
-        if model.config.action_head != 'flow_matching':
+        if model.config.action_head not in ('flow_matching', 'drifting'):
             feats = outputs.hidden_states # n_exit x (bs * action_seq_len, lang_len, d)
         else:
-            feats = outputs.attn_key_values 
+            feats = outputs.attn_key_values
 
         # rand_layer_feat = rand_layer_feat # (bs * action_seq_len, lang_len, d)
         sim = value_net(feats, mode='generate', proprio=batch["proprio"], start_idx=start_idx, end_idx=end_idx, pos_offset=pos_offset)

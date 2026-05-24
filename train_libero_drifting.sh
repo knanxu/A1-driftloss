@@ -28,9 +28,11 @@ if [ -n "${CUDA_VISIBLE_DEVICES-}" ]; then
 else
   nproc_per_node=$(nvidia-smi -L | wc -l)
 fi
-BATCH_PER_GPU=32
+BATCH_PER_GPU=16
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 STATE_MASK_PROB="0.0"
-global_batch_size=$((nproc_per_node * BATCH_PER_GPU))
+GLOBAL_BATCH=96
+global_batch_size=$GLOBAL_BATCH
 
 # Launch training
 torchrun \

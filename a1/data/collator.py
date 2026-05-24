@@ -182,7 +182,7 @@ class MMCollatorForAction:
             # only l1 regression need to add action tokens, flow matching not need
             if self.model_config.action_head == 'l1_regression':
                 self._add_action_tokens_to_batch(batch)
-            elif self.model_config.action_head == 'flow_matching':
+            elif self.model_config.action_head in ('flow_matching', 'drifting'):
                 self._add_proprio_tokens_to_batch(batch)
 
         for key in self.TEXT_KEYS:

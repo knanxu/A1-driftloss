@@ -1847,9 +1847,9 @@ class VLATrainer(Trainer):
                 position_ids=batch.get("position_ids"),
                 action_proprio=action_proprio,  ##
                 proprio_token_idx = batch["proprio_token_idx"],  ##
-                output_hidden_states=True if self.cfg.early_exit and self.cfg.model.action_head != 'flow_matching' else False,
+                output_hidden_states=True if self.cfg.early_exit and self.cfg.model.action_head not in ('flow_matching', 'drifting') else False,
                 train_exit_random_layer = True if self.cfg.train_exit_random_layer else None,
-                use_cache=True if self.cfg.model.action_head == 'flow_matching' else False
+                use_cache=True if self.cfg.model.action_head in ('flow_matching', 'drifting') else False
             )
             # ).logits
             # e_time = time.time()
@@ -1939,21 +1939,27 @@ class VLATrainer(Trainer):
             return action_loss
 
         # add action prediction loss
-        action_loss = torch.tensor(0.0, device=self.device)  
+        action_loss = torch.tensor(0.0, device=self.device)
 
         # check the type of outputs, dict or list
         if isinstance(outputs, dict):
-            pred_acts = outputs['predicted_actions']
-            diff_pred = outputs['diffusion_pred']
-            diff_target = outputs['diffusion_target']
-            action_loss += get_action_loss(pred_acts, diff_pred, diff_target)
+            if 'drifting_loss' in outputs and outputs['drifting_loss'] is not None:
+                action_loss += outputs['drifting_loss']
+            else:
+                pred_acts = outputs['predicted_actions']
+                diff_pred = outputs['diffusion_pred']
+                diff_target = outputs['diffusion_target']
+                action_loss += get_action_loss(pred_acts, diff_pred, diff_target)
         elif isinstance(outputs, list):
             num = len(outputs)
             for output in outputs:
-                pred_acts = output['predicted_actions']
-                diff_pred = output['diffusion_pred']
-                diff_target = output['diffusion_target']
-                action_loss += get_action_loss(pred_acts, diff_pred, diff_target)
+                if 'drifting_loss' in output and output['drifting_loss'] is not None:
+                    action_loss += output['drifting_loss']
+                else:
+                    pred_acts = output['predicted_actions']
+                    diff_pred = output['diffusion_pred']
+                    diff_target = output['diffusion_target']
+                    action_loss += get_action_loss(pred_acts, diff_pred, diff_target)
             action_loss /= num
         
         ##

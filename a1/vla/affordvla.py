@@ -23,6 +23,7 @@ from a1.config import (
 )
 # from a1.vla.constants import NUM_ACTIONS_CHUNK,ACTION_DIM,PROPRIO_DIM
 from a1.vla.action_heads import L1RegressionActionHead, DiffusionTransformerActionHead,DiffusionActionHead, FlowMatchingActionHead
+from a1.vla.drifting_util import drift_loss
 from a1.vla.projectors import ProprioProjector,NoisyActionProjector
 from a1.vla.dit.blocks import DiTBlock,FinalLayer,TimestepEmbedder
 from a1.vla.dit.model import DiT
@@ -99,7 +100,7 @@ class AffordVLA(Molmo):
             # flow matching expert head that cross-attends to prefix from main LLM
             self.action_head = FlowMatchingActionHead(
                 llm_dim=self.config.d_model,
-                action_dim=config.action_dim,  
+                action_dim=config.action_dim,
                 proprio_dim=config.proprio_dim,
                 horizon=config.num_actions_chunk,
                 qwen2_hidden_size=getattr(self.config, 'action_head_flow_matching_dim', 896),
@@ -115,6 +116,26 @@ class AffordVLA(Molmo):
                     self.config.n_kv_heads if self.config.n_kv_heads is not None else self.config.n_heads,
                 ),
             )
+        elif self.action_head_type == 'drifting':
+            # 与 flow_matching 共用 head 结构；区别仅在训练 loss 与推理 sample 方法
+            self.action_head = FlowMatchingActionHead(
+                llm_dim=self.config.d_model,
+                action_dim=config.fixed_action_dim,
+                proprio_dim=config.proprio_dim,
+                horizon=config.num_actions_chunk,
+                qwen2_hidden_size=getattr(self.config, 'action_head_flow_matching_dim', 896),
+                qwen2_num_layers=getattr(self.config, 'action_head_flow_matching_layers', self.config.n_layers),
+                qwen2_num_heads=getattr(self.config, 'action_head_flow_matching_heads', 8),
+                qwen2_intermediate_size=getattr(self.config, 'action_head_flow_matching_intermediate_size', 4096),
+                qwen2_num_kv_heads=getattr(
+                    self.config,
+                    'action_head_flow_matching_kv_heads',
+                    self.config.n_kv_heads if self.config.n_kv_heads is not None else self.config.n_heads,
+                ),
+            )
+            self.drifting_gen_per_label = config.drifting_gen_per_label
+            self.drifting_temperatures = config.drifting_temperatures
+            self.drifting_per_timestep_loss = config.drifting_per_timestep_loss
 
         if config.use_proprio:
             if config.proprio_dim != config.action_dim:
@@ -205,6 +226,28 @@ class AffordVLA(Molmo):
             # 'last_hidden_state': last_hidden_state  
         }
 
+    def predict_actions_drifting(self, attn_key_values, proprio, pos_offset):
+        """单步 drifting 推理：在 t=1 喂纯噪声，直接得到动作。"""
+        if not attn_key_values or len(attn_key_values) == 0:
+            raise ValueError("attn_key_values is empty; drifting requires KV cache from forward()")
+        device = attn_key_values[0][0].device
+        dtype = attn_key_values[0][0].dtype
+        B = attn_key_values[0][0].shape[0]
+
+        noise = torch.randn(
+            (B, self.config.num_actions_chunk, self.config.fixed_action_dim),
+            device=device, dtype=dtype,
+        )
+        t = torch.ones(B, device=device, dtype=dtype)
+
+        assert self.config.use_proprio, "drifting requires use_proprio=True"
+        assert proprio is not None, "action_proprio is required for drifting inference"
+
+        v = self.action_head.predict_vector_field(attn_key_values, proprio, noise, t, pos_offset=pos_offset)
+        # FM 约定下 v = noise - action，drifting 复用同样网络但单步采样
+        predicted_actions = noise - v
+        return predicted_actions
+
     def predict_actions(self,input_ids,images=None, **kwargs):
         if self.action_head_type == 'diffusion_openvla':
             return self.run_diffusion_sampling(input_ids,images, **kwargs)
@@ -266,7 +309,18 @@ class AffordVLA(Molmo):
                 x = x + dt * v
                 t_float += dt
             predicted_actions = x
-        
+        elif self.action_head_type == 'drifting':
+            # 单步采样：与 flow_matching 共用 prefix KV cache，但只跑一次 t=1 的网络
+            kwargs.pop('use_cache', None)
+            outputs = self.forward(input_ids, images=images, use_cache=True, **kwargs)
+            past_key_values = outputs.attn_key_values
+            state = kwargs.get('action_proprio', None)
+            if 'prefix_pad_masks' in kwargs and kwargs['prefix_pad_masks'] is not None:
+                pos_offset = kwargs['prefix_pad_masks'].to(torch.int64).sum(dim=1)
+            else:
+                pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
+            predicted_actions = self.predict_actions_drifting(past_key_values, state, pos_offset)
+
         return predicted_actions
 
 
@@ -486,7 +540,7 @@ class AffordVLA(Molmo):
             size_based_module_to_wrap.add(self.action_head.action_adaptor)
             size_based_module_to_wrap.add(self.action_head.condition_adaptor)
         
-        if hasattr(self, 'action_head') and self.action_head_type == 'flow_matching':
+        if hasattr(self, 'action_head') and self.action_head_type in ('flow_matching', 'drifting'):
             size_based_module_to_wrap.add(self.action_head.qwen2.model)
             size_based_module_to_wrap.add(self.action_head.action_out)
             # size_based_module_to_wrap.add(self.action_head.memory_proj)
@@ -949,8 +1003,8 @@ class AffordVLA(Molmo):
                 ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
 
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
-        if self.action_head_type == 'flow_matching':
-            attn_key_values = [] 
+        if self.action_head_type in ('flow_matching', 'drifting'):
+            attn_key_values = []
 
         # decoder layers
         all_hidden_states = []
@@ -1069,7 +1123,7 @@ class AffordVLA(Molmo):
                 target = noise
             
             elif self.action_head_type == 'flow_matching':
-                
+
                 B = target_actions.shape[0]
                 device = target_actions.device
                 dtype = self.head_dtype
@@ -1107,7 +1161,56 @@ class AffordVLA(Molmo):
                 # 维持 FM 路径的 dtype（AMD 上为 fp32），交由后续 loss 在 fp32 计算
                 predicted_actions = None
 
-            return {  
+            elif self.action_head_type == 'drifting':
+                # 与 flow_matching 共用网络；不同点：单步 t=1 + G 个噪声样本，用 drift_loss
+                assert self.config.use_proprio and action_proprio is not None, "drifting requires action_proprio"
+                assert attn_key_values is not None and len(attn_key_values) > 0, "drifting requires KV cache"
+
+                dtype = self.head_dtype
+                B = target_actions.shape[0]
+                G = self.drifting_gen_per_label
+                device = target_actions.device
+                action_horizon = self.config.num_actions_chunk
+                action_dim = self.config.fixed_action_dim
+
+                pos_offset = (input_ids != -1).to(torch.int64).sum(dim=1)
+                proprio_rep = action_proprio.repeat_interleave(G, dim=0).to(dtype)
+                pos_offset_rep = pos_offset.repeat_interleave(G, dim=0)
+                attn_key_values_rep = [
+                    (k.repeat_interleave(G, dim=0), v.repeat_interleave(G, dim=0))
+                    for k, v in attn_key_values
+                ]
+
+                noise = torch.randn(B * G, action_horizon, action_dim, device=device, dtype=dtype)
+                t_ones = torch.ones(B * G, device=device, dtype=dtype)
+                v_pred = self.action_head.predict_vector_field(
+                    attn_key_values_rep, proprio_rep, noise, t_ones, pos_offset=pos_offset_rep,
+                )
+                # FM 约定下 v = noise - action ⇒ pred_action = noise - v
+                pred_actions = (noise - v_pred).reshape(B, G, action_horizon, action_dim)
+
+                R_list = tuple(self.drifting_temperatures)
+                if self.drifting_per_timestep_loss:
+                    total_loss = torch.zeros(1, device=device, dtype=torch.float32)
+                    for t_idx in range(action_horizon):
+                        gen_t = pred_actions[:, :, t_idx, :].float()
+                        pos_t = target_actions[:, t_idx, :].unsqueeze(1).float()
+                        loss_t, _ = drift_loss(gen_t, pos_t, R_list=R_list)
+                        total_loss = total_loss + loss_t.mean()
+                    drifting_loss_value = total_loss / action_horizon
+                else:
+                    gen = pred_actions.reshape(B, G, -1).float()
+                    pos = target_actions.reshape(B, 1, -1).float()
+                    loss_vec, _ = drift_loss(gen, pos, R_list=R_list)
+                    drifting_loss_value = loss_vec.mean()
+
+                return {
+                    'outputs': outputs,
+                    'predicted_actions': None,
+                    'drifting_loss': drifting_loss_value,
+                }
+
+            return {
                 # 'logits': outputs.logits,  
                 'outputs': outputs,
                 'predicted_actions': predicted_actions,  

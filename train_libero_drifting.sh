@@ -31,7 +31,7 @@ fi
 BATCH_PER_GPU=16
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 STATE_MASK_PROB="0.0"
-GLOBAL_BATCH=96
+GLOBAL_BATCH=128
 global_batch_size=$GLOBAL_BATCH
 
 # Launch training
